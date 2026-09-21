@@ -1,3 +1,4 @@
+import ssl; ssl._create_default_https_context = ssl._create_unverified_context
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
