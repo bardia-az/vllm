@@ -26,6 +26,16 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         )
 
         return DFlashSpeculator(vllm_config, device)
+    elif speculative_config.method == "dflex":
+        # DFlash runtime with anchor-inclusive indexing: the checkpoint's
+        # dflash_config.sample_from_anchor=True makes DFlashSpeculator sample
+        # every block position (N queries per request, block_size draft
+        # tokens).
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+            DFlashSpeculator,
+        )
+
+        return DFlashSpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,

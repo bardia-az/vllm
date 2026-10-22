@@ -64,7 +64,7 @@ MTPModelTypes = Literal[
     "glm5_next_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash"]
+DFlashModelTypes = Literal["dflash", "dflex"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
@@ -1304,7 +1304,7 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in ("eagle", "eagle3", "dflash", "dflex", "dspark"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1380,7 +1380,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "dflex"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -1458,7 +1458,7 @@ class SpeculativeConfig:
                     ):
                         hf.n_predict = hf.block_size
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark", "dflex"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1910,14 +1910,20 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark", "dflex")
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""
         return self.use_eagle() and not self.disable_eagle_block_drop
 
     def use_dflash(self) -> bool:
+        # The bonus-anchor query layout (1 + N queries per step). dflex keeps
+        # this False: it samples from the anchor like DSpark, so its scheduling
+        # arithmetic flows through the parallel_drafting/use_eagle branches.
         return self.method == "dflash"
+
+    def use_dflex(self) -> bool:
+        return self.method == "dflex"
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"

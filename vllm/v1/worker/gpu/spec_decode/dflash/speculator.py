@@ -52,9 +52,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits exactly (bonus + N mask) query tokens per step.
-        self.num_query_per_req = 1 + self.num_speculative_steps
-
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
         )
@@ -65,19 +62,33 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.draft_model_config.hf_config
         )
 
-        # Whether the anchor query position is itself a prediction. DFlash default uses
-        # the anchor as the bonus token (only mask tokens predict); DSpark samples from
-        # the anchor and the N-1 mask token positions. See _prepare_dflash_inputs_kernel
+        # Whether the anchor query position is itself a prediction. DFlash uses
+        # the anchor as the bonus token (only mask tokens predict); dflex
+        # checkpoints (and any draft config setting sample_from_anchor=True)
+        # make the anchor the first prediction. See
+        # _prepare_dflash_inputs_kernel.
         dflash_config = (
             getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
         )
-        if dflash_config.get("sample_from_anchor", False):
-            raise ValueError(
-                "sample_from_anchor=True is not supported for DFlash. "
-                "DFlash uses a fixed 1+N query layout where the anchor "
-                "is the bonus token."
-            )
-        self.sample_from_anchor = False
+        self.sample_from_anchor = bool(dflash_config.get("sample_from_anchor", False))
+
+        # Each request emits exactly (bonus + N mask) query tokens per step,
+        # or exactly N queries when sampling from the anchor (the anchor is
+        # then itself the first sampled position, mirroring DSparkSpeculator).
+        self.num_query_per_req = (
+            self.num_speculative_steps
+            if self.sample_from_anchor
+            else 1 + self.num_speculative_steps
+        )
+        if self.sample_from_anchor:
+            block_size = dflash_config.get("block_size")
+            if block_size is not None and self.num_speculative_steps != block_size:
+                raise ValueError(
+                    "sample_from_anchor=True drafts num_speculative_tokens "
+                    f"tokens from a block of that size, but got "
+                    f"num_speculative_tokens={self.num_speculative_steps} "
+                    f"and block_size={block_size}."
+                )
 
         # Context positions for the K/V precompute. Populated by
         # prepare_dflash_inputs, and processed by the model's

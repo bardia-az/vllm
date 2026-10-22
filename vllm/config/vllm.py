@@ -736,7 +736,7 @@ class VllmConfig:
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
         spec = self.speculative_config
-        if spec is None or spec.method != "dflash":
+        if spec is None or spec.method not in ("dflash", "dflex"):
             return False
         draft_config = getattr(spec, "draft_model_config", None)
         if draft_config is None:
@@ -2850,11 +2850,11 @@ class VllmConfig:
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
-            # DFlash and DSpark use parallel drafting natively in V2 via their
-            # own speculators.
+            # DFlash, dflex, and DSpark use parallel drafting natively in V2 via
+            # their own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dspark", "dflex")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 

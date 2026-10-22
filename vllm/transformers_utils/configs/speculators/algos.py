@@ -130,6 +130,29 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     )
 
 
+@register_speculator("dflex")
+def update_dflex(config_dict: dict, pre_trained_config: dict) -> None:
+    """Apply dflex specific configuration transformations.
+
+    dflex is DFlash with next-token (anchor-inclusive) output indexing: the
+    output at block position ``i`` predicts the token at sequence position
+    ``a + i + 1``, so the anchor's own output is the first draft token and a
+    block of ``block_size`` positions drafts ``block_size`` tokens (DFlash
+    drafts ``block_size - 1`` from the same inputs). It reuses the DFlash
+    runtime and model loader unchanged; only the query layout differs (N
+    queries per step, every position sampled).
+    """
+    update_dflash(config_dict, pre_trained_config)
+    if config_dict.get("sample_from_anchor") is False:
+        raise ValueError(
+            "dflex checkpoints must set sample_from_anchor=True (a False "
+            "value is the DFlash bonus-anchor layout; the checkpoint's "
+            "speculators_model_type says dflex)."
+        )
+    pre_trained_config["dflash_config"]["sample_from_anchor"] = True
+    pre_trained_config["dflash_config"]["block_size"] = config_dict.get("block_size")
+
+
 @register_speculator("dflash2")
 def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
     """

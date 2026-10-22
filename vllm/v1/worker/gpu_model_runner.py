@@ -676,6 +676,14 @@ class GPUModelRunner(
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dflex():
+                # DFlashProposer implements the bonus-anchor 1+N layout only;
+                # dflex is served by the speculator stack (Model Runner V2).
+                raise ValueError(
+                    "method 'dflex' requires the V2 model runner "
+                    "(default when Triton is available; unset "
+                    "VLLM_USE_V2_MODEL_RUNNER=0 to use it)."
+                )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
