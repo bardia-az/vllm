@@ -154,3 +154,40 @@ def test_non_speculators_model_passes_user_config_through_unchanged():
     assert model == "fake-org/plain-llama"
     assert tok is None
     assert spec == user_overrides
+
+
+_DNEST_CONFIG_DICT = {
+    "architectures": ["DNestDraftModel"],
+    "aux_hidden_state_layer_ids": [2, 10, 18, 26, 34],
+    "block_size": 16,
+    "draft_vocab_size": 151936,
+    "init_mode": "target_after_extracted",
+    "init_source_layers": [2, 10, 18, 26, 34],
+    "fusion_init": "random",
+    "copied_lr_scale": 1.0,
+    "init_final_norm": False,
+    "mask_token_id": 151669,
+    "sample_from_anchor": False,
+    "sliding_window_non_causal": False,
+    "speculators_config": _SPECULATORS_CONFIG_DICT["speculators_config"],
+    "speculators_model_type": "dnest",
+    "transformer_layer_config": {},
+}
+
+
+def test_speculators_dnest_maps_to_dflash_method():
+    """A dnest checkpoint (DFlash + target-derived init) serves via the
+    DFlash runtime: method rewritten to dflash, dflash_config derived, and
+    the architecture forced to the DFlash model loader."""
+    with _patched_get_config_dict(_DNEST_CONFIG_DICT):
+        model, tok, spec = maybe_override_with_speculators(
+            model="fake-org/fake-dnest-spec",
+            tokenizer=None,
+            trust_remote_code=False,
+            vllm_speculative_config=None,
+        )
+
+    assert spec is not None
+    assert spec["method"] == "dflash"
+    assert spec["model"] == "fake-org/fake-dnest-spec"
+    assert model == "fake-org/fake-verifier"
