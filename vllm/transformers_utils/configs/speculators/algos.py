@@ -177,6 +177,19 @@ def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
             pre_trained_config["dflash_config"][key] = config_dict[key]
 
 
+@register_speculator("dnest")
+def update_dnest(config_dict: dict, pre_trained_config: dict) -> None:
+    """Apply dnest specific configuration transformations.
+
+    dnest is a DFlash drafter whose decoder layers were initialised from
+    target-model layers at training time. It is architecturally identical
+    to DFlash (the init_mode / fusion_init / copied_lr_scale config fields
+    only describe how training started), so it reuses the DFlash runtime
+    (method="dflash") and model loader unchanged.
+    """
+    update_dflash(config_dict, pre_trained_config)
+
+
 @register_speculator("dspark")
 def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     """
