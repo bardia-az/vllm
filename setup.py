@@ -1331,7 +1331,43 @@ def get_requirements() -> list[str]:
             if "humming-kernels[cu13]" in req and cuda_major == "12":
                 req = req.replace("humming-kernels[cu13]", "humming-kernels[cu12]")
             modified_requirements.append(req)
-        requirements = modified_requirements
+        # Gate CUDA-only requirements to x86_64: this metadata also serves
+        # the Ascend NPU (aarch64) environment, where the torch family comes
+        # from the npu dependency group (torch 2.10.0 cpu + torch-npu) and
+        # the NVIDIA/CUDA wheels do not exist.
+        cuda_only_prefixes = (
+            "numba",
+            "torch==",
+            "torchaudio",
+            "torchvision",
+            "torchcodec",
+            "PyNvVideoCodec",
+            "flashinfer",
+            "apache-tvm-ffi",
+            "tilelang",
+            "nvidia-cudnn-frontend",
+            "nvtx",
+            "fastsafetensors",
+            "instanttensor",
+            "nvidia-cutlass-dsl",
+            "quack-kernels",
+            "tokenspeed-mla",
+            "humming-kernels",
+        )
+
+        def _gate_to_x86_64(req: str) -> str:
+            base = req.split(" #")[0].strip()
+            marker = "platform_machine == 'x86_64'"
+            if ";" in base:
+                return f"{base} and {marker}"
+            return f"{base} ; {marker}"
+
+        requirements = [
+            _gate_to_x86_64(req)
+            if any(req.startswith(prefix) for prefix in cuda_only_prefixes)
+            else req
+            for req in modified_requirements
+        ]
     elif _is_hip():
         requirements = _read_requirements("rocm.txt")
     elif _is_tpu():
@@ -1509,8 +1545,11 @@ setup(
     rust_extensions=rust_extensions,
     install_requires=get_requirements(),
     extras_require={
-        # AMD Zen CPU optimizations via zentorch
-        "zen": ["zentorch==2.13.0.0"],
+        # AMD Zen CPU optimizations via zentorch.
+        # Fork fix: several extras pin packages with no aarch64 wheels or
+        # sdists; gated to x86_64 so the aarch64 (Ascend NPU) lock split can
+        # resolve. On x86_64 the extras behave exactly as upstream.
+        "zen": ["zentorch==2.13.0.0; platform_machine == 'x86_64'"],
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],
         "tensorizer": ["tensorizer==2.10.1"],
         "fastsafetensors": ["fastsafetensors >= 0.3.3"],
@@ -1526,14 +1565,14 @@ setup(
         "video": [],  # Kept for backwards compatibility
         # NVIDIA DeepStream (NVDEC) GPU video-decode backend. Linux x86-64
         # only; also needs system GStreamer + libv4l (see docs).
-        "deepstream": ["nvidia-deepstream-videodecode-cu13>=9.0.2"],
+        "deepstream": ["nvidia-deepstream-videodecode-cu13>=9.0.2; platform_machine == 'x86_64'"],
         "flashinfer": [],  # Kept for backwards compatibility
         # "b12x": ["b12x==1.3.0"],  #FIX: to avoid errors in generating the top-level .lock file
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:
         #   - .buildkite/test_areas/kernels.yaml
         #   - .buildkite/test-amd.yaml
-        "helion": ["helion==1.4.0"],
+        "helion": ["helion==1.4.0; platform_machine == 'x86_64'"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],
         # Optional deps for OpenTelemetry tracing
