@@ -7,7 +7,12 @@ requires = [
     "setuptools>=77.0.3,<81.0.0",
     "setuptools-scm>=8.0",
     "setuptools-rust>=1.9.0",
-    "torch == 2.13.0",
+    # aarch64 (NPU) builds are metadata-only (VLLM_TARGET_DEVICE=empty) and must
+    # build against the runtime torch 2.10: torch 2.13.0 has no aarch64 entry in
+    # the workspace lock (x86_64-only wheel), so its +cpu aarch64 wheel fails
+    # uv's lock hash verification during build isolation.
+    "torch == 2.13.0; platform_machine != 'aarch64'",
+    "torch == 2.10.0; platform_machine == 'aarch64'",
     "wheel",
     "jinja2",
 ]
