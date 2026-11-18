@@ -397,6 +397,20 @@ class DFlashQwen3Model(nn.Module):
             "use_aux_hidden_state",
             getattr(self.config, "use_aux_hidden_state", True),
         )
+        # dnest per-layer context: each layer conditions on its own extracted
+        # target hidden state, so there is no fused feature (fc + hidden_norm).
+        self.context_mode = drafter_config.get(
+            "context_mode", getattr(self.config, "context_mode", "fused")
+        )
+        self.kv_mode = drafter_config.get(
+            "kv_mode", getattr(self.config, "kv_mode", "frozen_shared")
+        )
+        self.use_fusion = self.use_aux_hidden_state and (
+            self.context_mode != "per_layer"
+        )
+        # Split mode side-loads the frozen context key/value path
+        # (layers.{j}.self_attn.context_kv.*) intercepted in load_weights.
+        self._context_kv_checkpoint_weights: dict[int, dict[str, torch.Tensor]] = {}
 
         current_vllm_config = get_current_vllm_config()
 
@@ -433,7 +447,7 @@ class DFlashQwen3Model(nn.Module):
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
-        if self.use_aux_hidden_state:
+        if self.use_fusion:
             self.fc = ReplicatedLinear(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
@@ -467,6 +481,9 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
+        if self.context_mode == "per_layer":
+            self._build_per_layer_context_kv_buffers(layers_attn)
+            return
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
@@ -483,6 +500,96 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+
+    def _build_per_layer_context_kv_buffers(
+        self, layers_attn: list[nn.Module]
+    ) -> None:
+        """Stack the per-layer context key/value path for precomputation.
+
+        Shared kv_modes (frozen_shared / trainable_shared) reuse each layer's
+        own input_layernorm and qkv/k_norm weights; split uses the frozen
+        context_kv copies side-loaded from the checkpoint. The KV weights are
+        stacked transposed ([L, hidden, 2*kv_size]) for one bmm over all
+        layers, mirroring the fused mode's single GEMM.
+        """
+        num_layers = len(layers_attn)
+        layers = self.layers
+
+        if self.kv_mode == "split":
+            missing = [
+                (j, suffix)
+                for j in range(num_layers)
+                for suffix in ("input_layernorm", "k_proj", "v_proj", "k_norm")
+                if suffix not in self._context_kv_checkpoint_weights.get(j, {})
+            ]
+            if missing:
+                raise ValueError(
+                    "dnest per_layer (kv_mode='split') requires the frozen "
+                    "context key/value tensors layers.{j}.self_attn."
+                    f"context_kv.<name> for every layer; missing {missing}."
+                )
+            norm_weights = [
+                self._context_kv_checkpoint_weights[j]["input_layernorm"]
+                for j in range(num_layers)
+            ]
+            k_norm_weights = [
+                self._context_kv_checkpoint_weights[j]["k_norm"]
+                for j in range(num_layers)
+            ]
+            # Shard the context KV projections across TP ranks exactly like
+            # QKVParallelLinear shards the layer's own KV heads.
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            total_kv_heads = layers_attn[0].total_num_kv_heads
+            kv_heads_local = layers_attn[0].num_kv_heads
+            if total_kv_heads >= tp_size:
+                head_offset = tp_rank * kv_heads_local
+            else:
+                head_offset = (
+                    tp_rank // (tp_size // total_kv_heads)
+                ) * kv_heads_local
+            head_dim = layers_attn[0].head_dim
+            row = slice(
+                head_offset * head_dim, (head_offset + kv_heads_local) * head_dim
+            )
+            # Side-loaded tensors bypass AutoWeightsLoader's dtype handling.
+            model_dtype = layers_attn[0].qkv_proj.weight.dtype
+            kv_weights = [
+                torch.cat(
+                    (
+                        self._context_kv_checkpoint_weights[j]["k_proj"][row],
+                        self._context_kv_checkpoint_weights[j]["v_proj"][row],
+                    ),
+                    dim=0,
+                )
+                .to(model_dtype)
+                .t()
+                for j in range(num_layers)
+            ]
+            norm_weights = [w.to(model_dtype) for w in norm_weights]
+            k_norm_weights = [w.to(model_dtype) for w in k_norm_weights]
+        else:
+            norm_weights = [layer.input_layernorm.weight.data for layer in layers]
+            k_norm_weights = [a.k_norm.weight.data for a in layers_attn]
+            kv_weights = [
+                a.qkv_proj.weight[a.q_size :].t() for a in layers_attn
+            ]
+
+        # [L, hidden]: input_layernorm per layer, selected by the outermost
+        # index of the layered context states (same grouped-kernel contract
+        # as _k_norm_weights). Stacked onto the layers' device: shared modes
+        # alias already-loaded params, but split side-loads raw CPU tensors.
+        device = layers_attn[0].qkv_proj.weight.device
+        self._context_input_norm_weights = (
+            torch.stack(norm_weights, dim=0).contiguous().to(device)
+        )
+        # [L, hidden, 2*kv_size] for one bmm over all layers.
+        self._per_layer_kv_weight = (
+            torch.stack(kv_weights, dim=0).contiguous().to(device)
+        )
+        self._k_norm_weights = (
+            torch.stack(k_norm_weights, dim=0).contiguous().to(device)
+        )
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -535,6 +642,10 @@ class DFlashQwen3Model(nn.Module):
         num_kv_heads: int,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.context_mode == "per_layer":
+            return self._project_per_layer_context_kv(
+                context_states, num_ctx, num_layers, num_kv_heads, head_dim
+            )
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
@@ -557,6 +668,60 @@ class DFlashQwen3Model(nn.Module):
         all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
         all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
         return all_k, all_v
+
+    def _project_per_layer_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project per-layer context states: slice j is tap j (the extracted
+        input of draft layer j's source layer), normed by that layer's own
+        input_layernorm (or its frozen context_kv copy in split mode) and
+        projected by its context K/V path -- exactly the target layer's own
+        key/value computation."""
+        hidden_size = self.config.hidden_size
+        expected = num_layers * hidden_size
+        if context_states.shape[-1] != expected:
+            raise ValueError(
+                f"per_layer context expects [{expected} = {num_layers} layers "
+                f"x {hidden_size} hidden] concatenated hidden states, got "
+                f"{context_states.shape[-1]}. Check that the draft config's "
+                "aux_hidden_state_layer_ids matches the training taps."
+            )
+        # [num_ctx, L, hidden] -> [L, num_ctx, hidden]
+        layered = (
+            context_states[:, :expected]
+            .view(num_ctx, num_layers, hidden_size)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        # Grouped input RMSNorm: weight [L, hidden] selected by layer index.
+        normed = torch.empty_like(layered)
+        if current_platform.is_xpu():
+            for layer_idx in range(num_layers):
+                ops.rms_norm(
+                    normed[layer_idx],
+                    layered[layer_idx],
+                    self._context_input_norm_weights[layer_idx],
+                    self._rms_norm_eps,
+                )
+        else:
+            ops.rms_norm(
+                normed,
+                layered,
+                self._context_input_norm_weights,
+                self._rms_norm_eps,
+            )
+        # One bmm over all layers: [L, num_ctx, hidden] @ [L, hidden, 2*kv]
+        all_kv = torch.bmm(normed, self._per_layer_kv_weight)
+        all_kv = all_kv.view(num_layers, num_ctx, 2, num_kv_heads, head_dim)
+        return (
+            all_kv[:, :, 0].contiguous(),  # [L, num_ctx, nkv, hd]
+            all_kv[:, :, 1].contiguous(),  # [L, num_ctx, nkv, hd]
+        )
 
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
@@ -781,11 +946,23 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             context_states, context_positions, context_slot_mapping
         )
 
+    @property
+    def combine_output_hidden_size(self) -> int:
+        """Width of the tensor combine_hidden_states returns."""
+        if self.model.context_mode == "per_layer":
+            return self.config.hidden_size * self.config.num_hidden_layers
+        return self.config.hidden_size
+
     def combine_hidden_states(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if not self.model.use_aux_hidden_state:
+            return hidden_states
+        if self.model.context_mode == "per_layer":
+            # The concatenated per-layer taps flow through unchanged; each
+            # layer's slice is normed and projected inside
+            # precompute_and_store_context_kv.
             return hidden_states
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
@@ -815,6 +992,18 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
             if "t2d" in name:
                 continue
+            if "context_kv." in name:
+                # dnest per_layer split mode: the frozen context key/value
+                # path. Intercepted here so the stacked qkv/gate_up mapping
+                # below cannot swallow context_kv.k_proj/v_proj; the tensors
+                # are stacked in _build_per_layer_context_kv_buffers.
+                parts = name.split(".")
+                layer_idx = int(parts[1])
+                suffix = ".".join(parts[parts.index("context_kv") + 1 : -1])
+                self.model._context_kv_checkpoint_weights.setdefault(layer_idx, {})[
+                    suffix
+                ] = loaded_weight
+                continue
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
@@ -837,8 +1026,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             orig_to_new_substr["draft_id_to_target_id"] = None
         if not includes_embed_tokens:
             orig_to_new_substr["embed_tokens"] = None
-        if not self.model.use_aux_hidden_state:
+        if not self.model.use_fusion:
+            # No fusion projection: dnest per_layer checkpoints (and
+            # aux-hidden-state-free checkpoints) ship neither tensor.
             orig_to_new_substr["fc."] = None
+            orig_to_new_substr["hidden_norm."] = None
         if not self.model.has_separate_mask_embedding:
             orig_to_new_substr["mask_embedding"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)

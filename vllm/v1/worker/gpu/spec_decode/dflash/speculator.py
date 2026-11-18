@@ -45,6 +45,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         super().__init__(vllm_config, device)
 
+        # dnest per-layer context: combine_hidden_states passes the
+        # concatenated per-layer taps through unchanged, so the buffer
+        # holding its output must be num_draft_layers x wider.
+        dflash_config_init = (
+            getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
+        )
+        if dflash_config_init.get("context_mode") == "per_layer":
+            self.hidden_size = (
+                self.hidden_size * self.draft_model_config.hf_config.num_hidden_layers
+            )
+
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )

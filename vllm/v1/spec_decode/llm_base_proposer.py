@@ -107,6 +107,13 @@ class SpecDecodeBaseProposer:
         ):
             self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
 
+        # dnest per-layer context: combine_hidden_states passes the
+        # concatenated per-layer taps through unchanged, so any buffer
+        # holding its output must be num_draft_layers x wider.
+        dflash_cfg = getattr(draft_hf_config, "dflash_config", None) or {}
+        if dflash_cfg.get("context_mode") == "per_layer":
+            self.hidden_size = self.hidden_size * draft_hf_config.num_hidden_layers
+
         # Unifying eagle, draft model, and parallel drafting support.
         # DFlash always uses parallel drafting (all tokens in one pass),
         # but has an additional slot for the next_token_id (does not shift like EAGLE)
@@ -553,7 +560,10 @@ class SpecDecodeBaseProposer:
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
-            assert target_hidden_states.shape[-1] == self.hidden_size
+            # Fused drafts compress to hidden_size; dnest per_layer passes
+            # the concatenated taps (num_layers x hidden_size) through.
+            expected = getattr(model, "combine_output_hidden_size", self.hidden_size)
+            assert target_hidden_states.shape[-1] == expected
 
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
