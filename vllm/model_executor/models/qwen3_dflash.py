@@ -507,15 +507,16 @@ class DFlashQwen3Model(nn.Module):
         """Stack the per-layer context key/value path for precomputation.
 
         Shared kv_modes (frozen_shared / trainable_shared) reuse each layer's
-        own input_layernorm and qkv/k_norm weights; split uses the frozen
-        context_kv copies side-loaded from the checkpoint. The KV weights are
-        stacked transposed ([L, hidden, 2*kv_size]) for one bmm over all
-        layers, mirroring the fused mode's single GEMM.
+        own input_layernorm and qkv/k_norm weights; split / split_trainable
+        use the context_kv copies side-loaded from the checkpoint (frozen or
+        trained, identical at serve time). The KV weights are stacked
+        transposed ([L, hidden, 2*kv_size]) for one bmm over all layers,
+        mirroring the fused mode's single GEMM.
         """
         num_layers = len(layers_attn)
         layers = self.layers
 
-        if self.kv_mode == "split":
+        if self.kv_mode in ("split", "split_trainable"):
             missing = [
                 (j, suffix)
                 for j in range(num_layers)
@@ -524,9 +525,10 @@ class DFlashQwen3Model(nn.Module):
             ]
             if missing:
                 raise ValueError(
-                    "dnest per_layer (kv_mode='split') requires the frozen "
-                    "context key/value tensors layers.{j}.self_attn."
-                    f"context_kv.<name> for every layer; missing {missing}."
+                    "dnest per_layer (kv_mode='split'/'split_trainable') "
+                    "requires the context key/value tensors layers.{j}."
+                    "self_attn.context_kv.<name> for every layer; missing "
+                    f"{missing}."
                 )
             norm_weights = [
                 self._context_kv_checkpoint_weights[j]["input_layernorm"]
