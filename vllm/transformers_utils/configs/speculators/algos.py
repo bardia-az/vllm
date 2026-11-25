@@ -190,7 +190,8 @@ def update_dnest(config_dict: dict, pre_trained_config: dict) -> None:
     context_mode="per_layer" is the exception: each draft layer conditions
     on its own extracted target hidden state (no fc fusion), and kv_mode
     selects the context key/value path (frozen_shared / split /
-    trainable_shared). Both flow into dflash_config for the drafter.
+    split_trainable / trainable_shared). Both flow into dflash_config for
+    the drafter.
     """
     update_dflash(config_dict, pre_trained_config)
     if config_dict.get("context_mode") == "per_layer":

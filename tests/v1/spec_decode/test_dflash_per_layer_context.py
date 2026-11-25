@@ -72,7 +72,7 @@ def _make_attn(kv_mode, seed):
         ),
     )
     side_weights = {}
-    if kv_mode == "split":
+    if kv_mode in ("split", "split_trainable"):
         side_weights = {
             "input_layernorm": torch.rand(HIDDEN, generator=g) + 0.5,
             "k_proj": torch.randn(NUM_KV_HEADS * HEAD_DIM, HIDDEN, generator=g),
@@ -120,7 +120,7 @@ def _reference_kv(kv_mode, taps, layers, side):
     eps = 1e-6
     for j, layer in enumerate(layers):
         h = taps[j]
-        if kv_mode == "split":
+        if kv_mode in ("split", "split_trainable"):
             norm_w = side[j]["input_layernorm"]
             k_proj, v_proj, k_norm_w = (
                 side[j]["k_proj"],
@@ -146,7 +146,9 @@ def _reference_kv(kv_mode, taps, layers, side):
     return torch.stack(all_k), torch.stack(all_v)
 
 
-@pytest.mark.parametrize("kv_mode", ["frozen_shared", "split", "trainable_shared"])
+@pytest.mark.parametrize(
+    "kv_mode", ["frozen_shared", "split", "split_trainable", "trainable_shared"]
+)
 def test_per_layer_projection_matches_eager(kv_mode):
     """The stacked (grouped-norm + bmm) path reproduces the per-layer eager
     computation exactly, for every kv_mode's weight selection."""
@@ -173,9 +175,11 @@ def test_per_layer_projection_rejects_wrong_width():
         )
 
 
-def test_split_requires_side_loaded_context_kv():
-    """kv_mode=split without the frozen context_kv tensors fails loudly."""
-    model, _, _, _ = _make_model("split")
+@pytest.mark.parametrize("kv_mode", ["split", "split_trainable"])
+def test_split_requires_side_loaded_context_kv(kv_mode):
+    """The side-loading kv_modes without their context_kv tensors fail
+    loudly."""
+    model, _, _, _ = _make_model(kv_mode)
     model._context_kv_checkpoint_weights = {}
     with pytest.raises(ValueError, match="context key/value tensors"):
         model._build_context_kv_buffers(
@@ -190,13 +194,13 @@ def test_update_dnest_passes_per_layer_fields():
         "aux_hidden_state_layer_ids": [2, 10, 18, 26, 34],
         "mask_token_id": 151669,
         "context_mode": "per_layer",
-        "kv_mode": "split",
+        "kv_mode": "split_trainable",
     }
     pre_trained_config = {}
     algos.update_dnest(config_dict, pre_trained_config)
     dflash_config = pre_trained_config["dflash_config"]
     assert dflash_config["context_mode"] == "per_layer"
-    assert dflash_config["kv_mode"] == "split"
+    assert dflash_config["kv_mode"] == "split_trainable"
 
     fused = dict(config_dict, context_mode="fused")
     pre_trained_config = {}
@@ -277,7 +281,7 @@ def _make_model_from_target(kv_mode, target, sources):
                 weight=nn.Parameter(tl.input_layernorm.weight.data.clone())
             ),
         )
-        if kv_mode == "split":
+        if kv_mode in ("split", "split_trainable"):
             side[len(layers)] = {
                 "input_layernorm": tl.input_layernorm.weight.data.clone(),
                 "k_proj": tl.self_attn.k_proj.weight.data.clone(),
@@ -310,7 +314,9 @@ def _make_model_from_target(kv_mode, target, sources):
     return model
 
 
-@pytest.mark.parametrize("kv_mode", ["frozen_shared", "split"])
+@pytest.mark.parametrize(
+    "kv_mode", ["frozen_shared", "split", "split_trainable"]
+)
 def test_per_layer_projection_matches_target_kv_cache(kv_mode):
     """The serving projection reproduces a real Qwen3's own KV cache."""
     from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
